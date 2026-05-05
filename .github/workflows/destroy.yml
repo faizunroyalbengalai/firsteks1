@@ -1,0 +1,51 @@
+name: Destroy — firsteks1
+
+on:
+  workflow_dispatch:
+
+jobs:
+  destroy:
+    name: Terraform Destroy (EKS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.31.0'
+      - name: Update kubeconfig (to allow Terraform to talk to k8s provider)
+        run: |
+          # Best-effort — cluster may already be gone if destroy was partially run before
+          CLUSTER_NAME=$(echo "${{ secrets.PROJECT_NAME }}" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's/[^a-z0-9-]/-/g' \
+            | sed 's/-\{2,\}/-/g' \
+            | sed 's/^-//; s/-$//' \
+            | cut -c1-24 \
+            | sed 's/-$//')
+          aws eks update-kubeconfig \
+            --region "${{ secrets.AWS_REGION }}" \
+            --name "${CLUSTER_NAME}-eks" 2>/dev/null || echo "Cluster not found — continuing"
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+      - name: Terraform destroy
+        working-directory: terraform
+        run: |
+          terraform destroy -auto-approve \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}" \
+            -var="container_image=placeholder"
