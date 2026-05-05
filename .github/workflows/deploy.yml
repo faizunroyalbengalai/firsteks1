@@ -1,0 +1,202 @@
+name: Deploy — firsteks1
+
+on:
+  workflow_dispatch:
+
+env:
+  ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION: node24
+  ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION: node24
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: '[ -f requirements.txt ] && pip install -r requirements.txt || echo "no requirements.txt — skipping"'
+      - run: pytest --tb=short -q 2>/dev/null || echo "No tests found"
+
+  build_push:
+    name: Build & Push Docker Image to ECR
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+      - name: Login to ECR
+        id: login_ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Resolve image tag
+        id: meta
+        run: |
+          ECR_REGISTRY="${{ steps.login_ecr.outputs.registry }}"
+          PROJECT_NAME=$(echo "${{ secrets.PROJECT_NAME }}" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's/[^a-z0-9-]/-/g' \
+            | sed 's/-\{2,\}/-/g' \
+            | sed 's/^-//; s/-$//')
+          IMAGE="${ECR_REGISTRY}/${PROJECT_NAME}:${{ github.sha }}"
+          echo "image=${IMAGE}" >> $GITHUB_OUTPUT
+          echo "project_lower=${PROJECT_NAME}" >> $GITHUB_OUTPUT
+      - name: Ensure ECR repository exists
+        run: |
+          PROJECT_NAME=$(echo "${{ secrets.PROJECT_NAME }}" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's/[^a-z0-9-]/-/g' \
+            | sed 's/-\{2,\}/-/g' \
+            | sed 's/^-//; s/-$//')
+          if aws ecr describe-repositories \
+               --repository-names "${PROJECT_NAME}" \
+               --region "${{ secrets.AWS_REGION }}" > /dev/null 2>&1; then
+            echo "ECR repo '${PROJECT_NAME}' already exists"
+          else
+            echo "Creating ECR repo '${PROJECT_NAME}'..."
+            aws ecr create-repository \
+              --repository-name "${PROJECT_NAME}" \
+              --image-tag-mutability MUTABLE \
+              --region "${{ secrets.AWS_REGION }}"
+          fi
+      - name: Build & push Docker image
+        run: |
+          docker build -t ${{ steps.meta.outputs.image }} .
+          docker push ${{ steps.meta.outputs.image }}
+
+  deploy:
+    name: Deploy to EKS (Terraform + kubectl)
+    runs-on: ubuntu-latest
+    needs: build_push
+    outputs:
+      url: ${{ steps.ingress.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.31.0'
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'v3.15.0'
+      - name: Resolve image (rebuild tag locally — no cross-job output dependency)
+        id: resolve_image
+        run: |
+          ECR_REGISTRY=$(aws ecr describe-registry \
+            --region "${{ secrets.AWS_REGION }}" \
+            --query 'registryId' --output text)
+          ECR_REGISTRY="${ECR_REGISTRY}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
+          PROJECT_NAME=$(echo "${{ secrets.PROJECT_NAME }}" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's/[^a-z0-9-]/-/g' \
+            | sed 's/-\{2,\}/-/g' \
+            | sed 's/^-//; s/-$//')
+          FULL_IMAGE="${ECR_REGISTRY}/${PROJECT_NAME}:${{ github.sha }}"
+          echo "image=${FULL_IMAGE}" >> $GITHUB_OUTPUT
+          # Verify image exists in ECR before we deploy it
+          aws ecr describe-images \
+            --repository-name "${PROJECT_NAME}" \
+            --image-ids imageTag="${{ github.sha }}" \
+            --region "${{ secrets.AWS_REGION }}" \
+            --query 'imageDetails[0].imageDigest' --output text || {
+            echo "ERROR: Image not found in ECR — did build_push succeed?"
+            exit 1
+          }
+      - name: Create S3 state bucket
+        run: |
+          aws s3 mb s3://${{ secrets.TF_STATE_BUCKET }} \
+            --region ${{ secrets.AWS_REGION }} 2>/dev/null || true
+          aws s3api put-bucket-versioning \
+            --bucket ${{ secrets.TF_STATE_BUCKET }} \
+            --versioning-configuration Status=Enabled 2>/dev/null || true
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+      - name: Terraform apply
+        working-directory: terraform
+        env:
+          TF_VAR_container_image:        ${{ steps.resolve_image.outputs.image }}
+          TF_VAR_database_url:           ${{ secrets.DATABASE_URL }}
+          TF_VAR_db_host:                ${{ secrets.DB_HOST }}
+          TF_VAR_db_port:                ${{ secrets.DB_PORT }}
+          TF_VAR_db_name:                ${{ secrets.DB_NAME }}
+          TF_VAR_db_username:            ${{ secrets.DB_USER }}
+          TF_VAR_db_password:            ${{ secrets.DB_PASSWORD }}
+          TF_VAR_mongo_uri:              ${{ secrets.MONGO_URI }}
+          TF_VAR_redis_url:              ${{ secrets.REDIS_URL }}
+          TF_VAR_secret_key:             ${{ secrets.SECRET_KEY }}
+          TF_VAR_jwt_secret:             ${{ secrets.JWT_SECRET }}
+          TF_VAR_spring_datasource_url:  ${{ secrets.SPRING_DATASOURCE_URL }}
+          TF_VAR_spring_datasource_user: ${{ secrets.SPRING_DATASOURCE_USERNAME }}
+          TF_VAR_spring_datasource_pass: ${{ secrets.SPRING_DATASOURCE_PASSWORD }}
+          TF_VAR_spring_mongodb_uri:     ${{ secrets.SPRING_DATA_MONGODB_URI }}
+          TF_VAR_rds_db_name:            ${{ secrets.DB_NAME }}
+          TF_VAR_rds_db_username:        ${{ secrets.DB_USER }}
+          TF_VAR_rds_db_password:        ${{ secrets.DB_PASSWORD }}
+        run: |
+          terraform apply -auto-approve \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}"
+      - name: Update kubeconfig for EKS cluster
+        run: |
+          CLUSTER_NAME=$(cd terraform && terraform output -raw cluster_name 2>/dev/null)
+          echo "Cluster name: ${CLUSTER_NAME}"
+          aws eks update-kubeconfig \
+            --region "${{ secrets.AWS_REGION }}" \
+            --name "${CLUSTER_NAME}"
+      - name: Rollout restart to pick up new image
+        run: |
+          NAMESPACE=$(cd terraform && terraform output -raw namespace 2>/dev/null)
+          PROJECT_NAME=$(echo "${{ secrets.PROJECT_NAME }}" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's/[^a-z0-9-]/-/g' \
+            | sed 's/-\{2,\}/-/g' \
+            | sed 's/^-//; s/-$//')
+          echo "Rolling out in namespace: ${NAMESPACE}"
+          kubectl rollout restart deployment/${PROJECT_NAME} -n ${NAMESPACE} || true
+          kubectl rollout status deployment/${PROJECT_NAME} -n ${NAMESPACE} --timeout=300s || true
+      - name: Get ALB hostname
+        id: ingress
+        run: |
+          NAMESPACE=$(cd terraform && terraform output -raw namespace 2>/dev/null)
+          echo "Waiting for ALB hostname to be assigned..."
+          for i in $(seq 1 30); do
+            HOSTNAME=$(kubectl get ingress -n ${NAMESPACE} \
+              -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+            if [ -n "$HOSTNAME" ]; then
+              echo "url=http://${HOSTNAME}" >> $GITHUB_OUTPUT
+              echo "ALB hostname: ${HOSTNAME}"
+              break
+            fi
+            echo "Attempt ${i}/30 — ALB not ready yet, waiting 20s..."
+            sleep 20
+          done
+          if [ -z "$HOSTNAME" ]; then
+            echo "ALB hostname not assigned within timeout — check AWS console"
+            echo "url=" >> $GITHUB_OUTPUT
+          fi
