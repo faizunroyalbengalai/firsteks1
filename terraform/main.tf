@@ -70,24 +70,85 @@ variable "health_check_path" {
 }
 
 # ── Optional secrets injected into pod environment ────────────────────────────
-variable "database_url"  { type = string; default = ""; sensitive = true }
-variable "db_host"       { type = string; default = "" }
-variable "db_port"       { type = string; default = "" }
-variable "db_name"       { type = string; default = "" }
-variable "db_username"   { type = string; default = "" }
-variable "db_password"   { type = string; default = ""; sensitive = true }
-variable "mongo_uri"     { type = string; default = ""; sensitive = true }
-variable "redis_url"     { type = string; default = ""; sensitive = true }
-variable "secret_key"    { type = string; default = ""; sensitive = true }
-variable "jwt_secret"    { type = string; default = ""; sensitive = true }
-variable "spring_datasource_url"  { type = string; default = ""; sensitive = true }
-variable "spring_datasource_user" { type = string; default = "" }
-variable "spring_datasource_pass" { type = string; default = ""; sensitive = true }
-variable "spring_mongodb_uri"     { type = string; default = ""; sensitive = true }
+variable "database_url" {
+  type      = string
+  default   = ""
+  sensitive = true
+}
+variable "db_host" {
+  type    = string
+  default = ""
+}
+variable "db_port" {
+  type    = string
+  default = ""
+}
+variable "db_name" {
+  type    = string
+  default = ""
+}
+variable "db_username" {
+  type    = string
+  default = ""
+}
+variable "db_password" {
+  type      = string
+  default   = ""
+  sensitive = true
+}
+variable "mongo_uri" {
+  type      = string
+  default   = ""
+  sensitive = true
+}
+variable "redis_url" {
+  type      = string
+  default   = ""
+  sensitive = true
+}
+variable "secret_key" {
+  type      = string
+  default   = ""
+  sensitive = true
+}
+variable "jwt_secret" {
+  type      = string
+  default   = ""
+  sensitive = true
+}
+variable "spring_datasource_url" {
+  type      = string
+  default   = ""
+  sensitive = true
+}
+variable "spring_datasource_user" {
+  type    = string
+  default = ""
+}
+variable "spring_datasource_pass" {
+  type      = string
+  default   = ""
+  sensitive = true
+}
+variable "spring_mongodb_uri" {
+  type      = string
+  default   = ""
+  sensitive = true
+}
 
-variable "rds_db_name"     { type = string; default = "" }
-variable "rds_db_username" { type = string; default = "" }
-variable "rds_db_password" { type = string; default = ""; sensitive = true }
+variable "rds_db_name" {
+  type    = string
+  default = ""
+}
+variable "rds_db_username" {
+  type    = string
+  default = ""
+}
+variable "rds_db_password" {
+  type      = string
+  default   = ""
+  sensitive = true
+}
 
 locals {
   name_safe = trimsuffix(substr(lower(replace(replace(var.project_name, "_", "-"), " ", "-")), 0, 24), "-")
@@ -198,270 +259,3 @@ resource "kubernetes_namespace" "app" {
   metadata {
     name = local.namespace
     labels = {
-      project = var.project_name
-    }
-  }
-}
-
-# ── ECR Pull Secret (allows pods to pull from private ECR) ────────────────────
-data "aws_caller_identity" "current" {}
-
-resource "kubernetes_secret" "ecr_pull" {
-  depends_on = [kubernetes_namespace.app]
-  metadata {
-    name      = "ecr-pull-secret"
-    namespace = local.namespace
-  }
-  type = "kubernetes.io/dockerconfigjson"
-  data = {
-    ".dockerconfigjson" = jsonencode({
-      auths = {
-        "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com" = {
-          auth = base64encode("AWS:${data.aws_ecr_authorization_token.token.password}")
-        }
-      }
-    })
-  }
-}
-
-data "aws_ecr_authorization_token" "token" {}
-
-# ── App Secret (env vars) ──────────────────────────────────────────────────────
-resource "kubernetes_secret" "app_env" {
-  depends_on = [kubernetes_namespace.app]
-  metadata {
-    name      = "${local.name_safe}-env"
-    namespace = local.namespace
-  }
-  data = local.app_env
-}
-
-# ── Deployment ─────────────────────────────────────────────────────────────────
-resource "kubernetes_deployment" "app" {
-  depends_on = [module.eks, kubernetes_namespace.app]
-
-  metadata {
-    name      = local.name_safe
-    namespace = local.namespace
-    labels    = { app = local.name_safe }
-  }
-
-  spec {
-    replicas = var.replica_count
-
-    selector {
-      match_labels = { app = local.name_safe }
-    }
-
-    template {
-      metadata {
-        labels = { app = local.name_safe }
-      }
-
-      spec {
-        image_pull_secrets {
-          name = kubernetes_secret.ecr_pull.metadata[0].name
-        }
-
-        container {
-          name  = local.name_safe
-          image = var.container_image
-
-          port {
-            container_port = var.app_port
-          }
-
-          # Inject env vars from Kubernetes secret
-          dynamic "env_from" {
-            for_each = length(local.app_env) > 0 ? [1] : []
-            content {
-              secret_ref {
-                name = kubernetes_secret.app_env.metadata[0].name
-              }
-            }
-          }
-
-          resources {
-            requests = {
-              cpu    = "250m"
-              memory = "256Mi"
-            }
-            limits = {
-              cpu    = "500m"
-              memory = "512Mi"
-            }
-          }
-
-          liveness_probe {
-            http_get {
-              path = var.health_check_path
-              port = var.app_port
-            }
-            initial_delay_seconds = 30            period_seconds        = 15
-            failure_threshold     = 3
-          }
-
-          readiness_probe {
-            http_get {
-              path = var.health_check_path
-              port = var.app_port
-            }
-            initial_delay_seconds = 15            period_seconds        = 10
-            failure_threshold     = 3
-          }
-        }
-      }
-    }
-
-    strategy {
-      type = "RollingUpdate"
-      rolling_update {
-        max_surge       = "1"
-        max_unavailable = "0"
-      }
-    }
-  }
-}
-
-# ── Kubernetes Service (ClusterIP) ────────────────────────────────────────────
-resource "kubernetes_service" "app" {
-  depends_on = [kubernetes_namespace.app]
-  metadata {
-    name      = local.name_safe
-    namespace = local.namespace
-  }
-  spec {
-    selector = { app = local.name_safe }
-    port {
-      port        = 80
-      target_port = var.app_port
-    }
-    type = "ClusterIP"
-  }
-}
-
-# ── AWS Load Balancer Controller (installs the ALB Ingress Controller) ────────
-resource "helm_release" "aws_lbc" {
-  depends_on = [module.eks]
-  name       = "aws-load-balancer-controller"
-  repository = "https://aws.github.io/eks-charts"
-  chart      = "aws-load-balancer-controller"
-  namespace  = "kube-system"
-  version    = "1.8.1"
-
-  set {
-    name  = "clusterName"
-    value = module.eks.cluster_name
-  }
-  set {
-    name  = "serviceAccount.create"
-    value = "true"
-  }
-  set {
-    name  = "region"
-    value = var.aws_region
-  }
-  set {
-    name  = "vpcId"
-    value = module.vpc.vpc_id
-  }
-}
-
-# ── Ingress (ALB) ──────────────────────────────────────────────────────────────
-resource "kubernetes_ingress_v1" "app" {
-  depends_on = [helm_release.aws_lbc]
-  metadata {
-    name      = "${local.name_safe}-ingress"
-    namespace = local.namespace
-    annotations = {
-      "kubernetes.io/ingress.class"                        = "alb"
-      "alb.ingress.kubernetes.io/scheme"                   = "internet-facing"
-      "alb.ingress.kubernetes.io/target-type"              = "ip"
-      "alb.ingress.kubernetes.io/healthcheck-path"         = var.health_check_path
-      "alb.ingress.kubernetes.io/healthcheck-interval-seconds" = "30"
-      "alb.ingress.kubernetes.io/healthy-threshold-count"  = "2"
-      "alb.ingress.kubernetes.io/unhealthy-threshold-count" = "3"
-    }
-  }
-  spec {
-    rule {
-      http {
-        path {
-          path      = "/"
-          path_type = "Prefix"
-          backend {
-            service {
-              name = kubernetes_service.app.metadata[0].name
-              port {
-                number = 80
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-}
-
-# ── RDS (optional managed database) ──────────────────────────────────────────
-resource "aws_db_subnet_group" "main" {
-  name       = "${local.name_safe}-rds-subnet"
-  subnet_ids = module.vpc.private_subnets
-}
-
-resource "aws_security_group" "rds" {
-  name        = "${local.name_safe}-rds-sg"
-  description = "Allow EKS pods to reach RDS"
-  vpc_id      = module.vpc.vpc_id
-
-  ingress {
-    from_port       = 5432
-    to_port         = 5432
-    protocol        = "tcp"
-    security_groups = [module.eks.node_security_group_id]
-  }
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-}
-
-resource "aws_db_instance" "main" {
-  identifier             = "${local.name_safe}-db"
-  engine                 = "postgres"
-  engine_version         = "16"
-  instance_class         = "db.t3.micro"
-  allocated_storage      = 20
-  db_name                = local._rds_db_name
-  username               = local._rds_user
-  password               = var.rds_db_password
-  db_subnet_group_name   = aws_db_subnet_group.main.name
-  vpc_security_group_ids = [aws_security_group.rds.id]
-  skip_final_snapshot    = true
-  publicly_accessible    = false
-  multi_az               = false
-}
-
-# ── Outputs ────────────────────────────────────────────────────────────────────
-output "cluster_name" {
-  value = module.eks.cluster_name
-}
-
-output "cluster_endpoint" {
-  value = module.eks.cluster_endpoint
-}
-
-output "alb_hostname" {
-  value       = try(kubernetes_ingress_v1.app.status[0].load_balancer[0].ingress[0].hostname, "")
-  description = "ALB DNS name — app is live at http://<this value>"
-}
-
-output "namespace" {
-  value = local.namespace
-}
-
-output "ecr_repository_url" {
-  value = data.aws_ecr_repository.app.repository_url
-}
